@@ -1,0 +1,932 @@
+substitutions:
+  name: wifi-clock
+  friendly_name: WiFi Clock
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  includes:
+    - clock8266.h
+  # Template numbers and selects restore their value by publishing it, which
+  # does not fire their set_action, so a restored effect would show in the UI
+  # and do nothing. Push the lot into the component once everything is up.
+  on_boot:
+    priority: -100
+    then:
+      - output.turn_off: buzzer_reserved # seen to be LOW after boot on esp32c3, maybe also here
+      - lambda: |-
+          id(panel)->set_effect_speed(id(effect_speed).state);
+          id(panel)->set_effect_angle(id(effect_angle).state);
+          id(panel)->set_effect_hue_span(id(effect_hue_span).state);
+          id(panel)->set_flash_fade(id(fx_flash_fade).state);
+          std::string sp = id(effect_spread).current_option();
+          id(panel)->set_effect_spread(sp == "Per Digit" ? 1 : sp == "Per LED" ? 2 : 0);
+          std::string ef = id(effect_mode).current_option();
+          id(panel)->set_effect(ef == "Color Cycle" ? 1 : ef == "Flash" ? 2 : 0);
+
+esp8266:
+  board: d1_mini
+  restore_from_flash: true
+
+
+external_components:
+  - source: github://pulleralarm/HU-058_KitchenTimer
+    components: [ aip33628  ]
+
+logger:
+  level: INFO
+
+api:
+  #encryption:
+  reboot_timeout: 0s
+  actions:
+    - action: new_countdown
+      variables:
+        seconds: int
+      then:
+        - script.execute:
+            id: new_countdown
+            seconds: !lambda return seconds;
+    - action: show_text
+      variables:
+        message: string
+        duration: int
+        red: int
+        green: int
+        blue: int
+        am: bool
+        col_high: bool
+        col_low: bool
+        dash: bool
+        degree: bool
+      then:
+        - lambda: |-
+            if (wf_current != AUTO) return; // Button selection overrules HA
+            auto pan = id(panel);
+            if (red | green | blue) {
+              pan->set_effect(0);
+              pan->set_digit_color(0, red / 255.0f, green / 255.0f, blue / 255.0f);
+              pan->set_digit_color(1, red / 255.0f, green / 255.0f, blue / 255.0f);
+              pan->set_digit_color(2, red / 255.0f, green / 255.0f, blue / 255.0f);
+              pan->set_digit_color(3, red / 255.0f, green / 255.0f, blue / 255.0f);
+            }
+            aip33628::Annun annun = aip33628::Annun::NONE;
+            if (am) annun = annun | aip33628::Annun::AM;
+            if (col_high) annun = annun | aip33628::Annun::COL_HIGH;
+            if (col_low) annun = annun | aip33628::Annun::COL_LOW;
+            if (dash) annun = annun | aip33628::Annun::DASH;
+            if (degree) annun = annun | aip33628::Annun::DEGREE;
+            pan->show_text(message.c_str(),annun);
+            disp_next = EXTVAL;
+            wf_autonext = millis() + std::min(duration,600000); // display for at most 10min
+
+mdns:
+  disabled: true
+
+mqtt:
+  broker: !secret mqtt_broker
+  topic_prefix: "wificlock"
+  id: mqtt_client
+  discovery: true
+  discovery_unique_id_generator: mac
+  log_topic: null
+  reboot_timeout: 0s
+  on_message:
+    - topic: 'wificlock/new_countdown'
+      then:
+        - script.execute:
+            id: new_countdown
+            seconds: !lambda return atoi(x.c_str());
+    - topic: 'wificlock/show_text'
+      then:
+        - lambda: |-
+            if (wf_current != AUTO) return; // Button selection overrules MQTT
+            JsonDocument j = json::parse_json(x);
+            JsonObject root = j.as<JsonObject>();
+            std::string message;
+            int rgb[3] = { 0, 0, 0 };
+            aip33628::Annun annun = aip33628::Annun::NONE;
+            int duration = 5000; // 5 sec default
+            auto pan = id(panel);
+            
+            if (!root.isNull()) {
+              if (root["message"].is<const char *>()) {
+                message = static_cast<const char *>(root["message"]);
+              }
+              if (root["duration"].is<int>()) {
+                duration = root["duration"];
+              }
+              if (root["color"].is<JsonObject>()) {
+                JsonObject color = root["color"];
+                const char *rgbnames[] = { "r", "g", "b" };
+                for(int n=0; n<3; n++) {
+                  if (color[rgbnames[n]].is<int>()) rgb[n] = color[rgbnames[n]];
+                }
+              }
+              if (root["annunciators"].is<JsonObject>()) {
+                JsonObject a = root["annunciators"];
+                if (a["am"].is<bool>() && static_cast<bool>(a["am"])) annun = annun | aip33628::Annun::AM;
+                if (a["col_high"].is<bool>() && static_cast<bool>(a["col_high"])) annun = annun | aip33628::Annun::COL_HIGH;
+                if (a["col_low"].is<bool>() && static_cast<bool>(a["col_low"])) annun = annun | aip33628::Annun::COL_LOW;
+                if (a["dash"].is<bool>() && static_cast<bool>(a["dash"])) annun = annun | aip33628::Annun::DASH;
+                if (a["degree"].is<bool>() && static_cast<bool>(a["degree"])) annun = annun | aip33628::Annun::DEGREE;
+              }
+            } else {
+              message = x;
+            }
+            if (rgb[0] | rgb[1] | rgb[2]) {
+              pan->set_effect(0);
+              pan->set_digit_color(0, rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f);
+              pan->set_digit_color(1, rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f);
+              pan->set_digit_color(2, rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f);
+              pan->set_digit_color(3, rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f);
+            }
+            pan->show_text(message.c_str(),annun);
+            disp_next = EXTVAL;
+            wf_autonext = millis() + std::min(duration,600000); // display for at most 10min
+
+json:
+
+web_server:
+  version: 3
+
+ota:
+  - platform: esphome
+    on_begin:
+      then:
+        - lambda: timer1_disable();
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # There is no RTC on this board, so a cold boot with no network means no
+  # time at all. The panel shows four dashes until it has one.
+  ap:
+    ssid: ${friendly_name} Setup
+    password: !secret wifi_fallback
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+    servers:
+     - !secret ntp_server
+
+aip33628:
+  id: panel
+  clk_pin: GPIO12    # MCU socket pin 14 (HU-058D) or 16 (HU-058/SE), driver 1
+  data_pin: GPIO13   # MCU socket pin 5,  driver 1
+  data2_pin: GPIO14  # MCU socket pin 2,  driver 2
+  # Ceiling on IS[3:0], 0 to 15. Fixed, never varied by content. The stock
+  # firmware ran 0xF and drew 404mA doing it. Drop this if the drivers
+  # run hotter than you want. See docs/display-map.md.
+  max_current: 15
+
+#i2c:
+#  sda: GPIO4
+#  scl: GPIO5
+
+light:
+  - platform: aip33628
+    id: display
+    aip33628_id: panel
+    name: Display
+    restore_mode: ALWAYS_ON
+    # Gamma is applied inside the component, because it also has to allow for
+    # the 2.5mA floor the drivers cannot go below. Leaving it on here as well
+    # would square it.
+    gamma_correct: 1.0
+    on_turn_on:
+      - script.execute: set_autobrightness
+
+interval:
+  - interval: 0.1s
+    startup_delay: 1s
+    then:
+      - lambda: |-
+          auto pan = id(panel);
+          if (disp_current != disp_next) {
+            switch(disp_next) {
+              case CD1:
+                pan->set_effect(0);
+                pan->set_digit_color(0,0,1,0);
+                pan->set_digit_color(1,0,1,0);
+                pan->set_digit_color(2,0,1,0);
+                pan->set_digit_color(3,0,1,0);
+                break;
+              case CD2:
+                pan->set_effect(0);
+                pan->set_digit_color(0,0.7,0.7,0);
+                pan->set_digit_color(1,0.7,0.7,0);
+                pan->set_digit_color(2,0.7,0.7,0);
+                pan->set_digit_color(3,0.7,0.7,0);
+                break;
+              case CD3:
+                pan->set_effect(0);
+                pan->set_digit_color(0,1,0,0);
+                pan->set_digit_color(1,1,0,0);
+                pan->set_digit_color(2,1,0,0);
+                pan->set_digit_color(3,1,0,0);
+                break;
+              case CLOCK:
+              case SECONDS:
+              case TEMP:
+              case HUM:
+                if (disp_current == CD1 || disp_current == CD2 || disp_current == CD3 || disp_current == EXTVAL) {
+                  pan->clear_digit_colors();
+                  std::string ef = id(effect_mode).current_option();
+                  pan->set_effect(ef == "Color Cycle" ? 1 : ef == "Flash" ? 2 : 0);
+                }
+                break;
+              case EXTVAL: // Set from HA, MQTT, etc, nothing todo here
+                break;
+            }
+            disp_current = disp_next;
+          }
+          aip33628::Annun annun = aip33628::Annun::NONE;
+          if (wf_current == CDSET) annun = aip33628::Annun::AM;
+          if ((countdowns[0].is_running() || countdowns[1].is_running() || countdowns[2].is_running()) &&
+               ((millis() / 1000) % 2 == 0)) annun = aip33628::Annun::DASH;
+          switch(disp_current) {
+            case CLOCK:
+              pan->show_clock_once(id(sntp_time),annun,false,id(mqtt_client).is_connected());
+              break;
+            case TEMP:
+              pan->show_temp_once(id(langtemp).state,'C',annun);
+              break;
+            case HUM:
+              pan->show_hum_once(id(langhum).state,annun);
+              break;
+            case CD1:
+              pan->show_text(countdowns[0].reststr_gui().c_str(),annun);
+              break;
+            case CD2:
+              pan->show_text(countdowns[1].reststr_gui().c_str(),annun);
+              break;
+            case CD3:
+              pan->show_text(countdowns[2].reststr_gui().c_str(),annun);
+              break;
+            default:
+              break;
+          }
+  - interval: 1s
+    then:
+      lambda: |-
+        auto cd = id(cd1_to);
+        std::string reststr = countdowns[0].reststr_ha();
+        if (cd->state != reststr) cd->publish_state(reststr);
+        cd = id(cd2_to);
+        reststr = countdowns[1].reststr_ha();
+        if (cd->state != reststr) cd->publish_state(reststr);
+        cd = id(cd3_to);
+        reststr = countdowns[2].reststr_ha();
+        if (cd->state != reststr) cd->publish_state(reststr);
+  - interval: 0.2s
+    startup_delay: 1s
+    then:       
+      lambda: |-
+        uint32_t now = millis();
+        bool cd_running = countdowns[0].is_running() || countdowns[1].is_running() || countdowns[2].is_running();
+        // Check countdown alarms
+        if (cd_running) {
+          for(int n=0; n<3; ++n) {
+            Countdown &cd = countdowns[n];
+            if (cd.is_running() && cd.is_alarm() && !cd.is_buzzing()) {
+              cd.set_buzzing();
+              id(buzzer_beep).stop();
+              id(buzzer_beep).execute();
+            } 
+          }   
+        }     
+        if (wf_current != AUTO) {
+          if (now > wf_autonext) wf_current = AUTO; // Timeout
+          if (wf_current == CDSET && countdowns[wf_countdown].is_running()) {
+            wf_current = CDDISP; // Countdown wurde von aussen gestartet
+          }
+          if (wf_current == CDDISP || wf_current == CDSET) {
+            switch(wf_countdown) {
+              case 0 : disp_next = CD1; break;
+              case 1 : disp_next = CD2; break;
+              case 2 : disp_next = CD3; break;
+              default: break;
+            }
+          }
+        }
+        // dann den AUTO-Teil pruefen
+        if (wf_current == AUTO) {
+          // Zuerst durchschalten, dann uebersteuern
+          if (now > wf_autonext) {
+            switch(disp_next) {
+              case CLOCK:
+                if (id(langtemp).has_state() && id(thavail).get_state() == "online") {
+                  disp_next = TEMP;
+                  wf_autonext = now + (cd_running?2000:3000);
+                  break;
+                }
+                // Fall through until default whenever a state should be displayed
+              case TEMP:
+                if (id(langhum).has_state() && id(thavail).get_state() == "online") {
+                  disp_next = HUM;
+                  wf_autonext = now + (cd_running?2000:3000);
+                  break;
+                }
+              case HUM:
+                if (countdowns[0].is_running()) {
+                  disp_next = CD1;
+                  wf_autonext = now + 5000;
+                  break;
+                }
+              case CD1:
+                if (countdowns[1].is_running()) {
+                  disp_next = CD2;
+                  wf_autonext = now + 5000;
+                  break;
+                }
+              case CD2:
+                if (countdowns[2].is_running()) {
+                  disp_next = CD3;
+                  wf_autonext = now + 5000;
+                  break;
+                }
+              default:
+                disp_next = CLOCK;
+                wf_autonext = now + (cd_running?3000:5000);
+                break;
+            }
+          }
+          // Ein Countdown < 90 Sekunden, den mit geringstem Delay immer anzeigen
+          if (cd_running) {
+            int cd = -1;
+            uint32_t cmp = 90000; // vs int32_t restms() nimmt Countdown < 0 aus dem Spiel
+            for(int n=0; n<3; n++) {
+              if (countdowns[n].is_running() && static_cast<uint32_t>(countdowns[n].restms()) < cmp) { cd = n; cmp = countdowns[n].restms(); }
+            }
+            switch(cd) {
+              case 0 : disp_next = CD1; break;
+              case 1 : disp_next = CD2; break;
+              case 2 : disp_next = CD3; break;
+              default: break;
+            }
+          }
+        }
+ 
+
+# Lichtsensor von https://github.com/mrceedjay/HU-058_ESPHome-NTC-LDR-Buzzer
+sensor:
+  - platform: adc
+    pin: GPIO17
+    id: light_sensor
+    name: Ambient Light
+    update_interval: 1s
+    unit_of_measurement: "%"
+    device_class: ""
+    accuracy_decimals: 0
+    retain: false
+    filters:
+      - calibrate_linear:
+          method: exact
+          datapoints:
+            - 0.01 -> 100.0
+            - 1.0 -> 0.0
+      - clamp:
+          min_value: 0.0
+          max_value: 100.0
+      - delta: 1.0
+    on_value:
+      then:
+        script.execute: set_autobrightness
+
+  - platform: mqtt_subscribe
+    id: langtemp
+    internal: true
+    name: "Temperature"
+    accuracy_decimals: 1
+    topic: kueche3/sensor/temperature/state
+  - platform: mqtt_subscribe
+    id: langhum
+    name: "Luftfeuchtigkeit"
+    internal: true
+    accuracy_decimals: 1
+    topic: kueche3/sensor/luftfeuchtigkeit/state
+
+  - platform: wifi_signal
+    name: "WiFi Signal Sensor"
+    update_interval: 180s
+    retain: false
+
+# The two front panel buttons. Nothing on the board pulls these nets up. The
+# stock 8051 held them high with its own quasi-bidirectional port pullup, and
+# that chip is out of the socket, so the ESP32 internal pullup is the only one
+# and the lines never see 5V. Switch closed shorts to ground, hence inverted.
+binary_sensor:
+  - platform: gpio
+    id: button_1
+    name: Button 1
+    internal: true
+    pin:
+      number: GPIO3
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_double_click:
+      then:
+        - logger.log: "Doubleclick"
+        - lambda: |-
+            Countdown &cd = countdowns[wf_countdown];
+            switch(wf_current) {
+              case CDDISP:
+                if (!cd.is_running()) {
+                  wf_current = CDSET;
+                  wf_autonext = millis() + 3600000;
+                }
+                break;
+              case CDSET:
+                if (!cd.is_running()) {
+                  wf_current = CDDISP;
+                  id(cdstartstop)->execute(wf_countdown,true);
+                  wf_autonext = millis() + 3000;
+                }
+                break;
+              default:
+                break;
+              }
+    on_multi_click:
+      - timing:
+          - on for 30ms to 350ms
+          - off for at least 150ms
+        then:
+          - logger.log: "Multiclicksingleclick"
+          - lambda: |-
+              // Immer: laufenden Alarm beendetn
+              if (id(buzzer_beep).is_running()) { // Stop alarms
+                id(buzzer_beep).stop();
+                id(stop_alarms).execute();
+                return;
+              } 
+              Countdown &cd = countdowns[wf_countdown];
+              switch(wf_current) {
+                case CDDISP:
+                  if (cd.is_running()) {
+                    id(cdstartstop)->execute(wf_countdown,false);
+                    wf_autonext = millis() + 3600000;
+                  } else {
+                    id(cdstartstop)->execute(wf_countdown,true);
+                    wf_autonext = millis() + 10000;
+                  }
+                  break;
+                case CDSET:
+                  cd.modify(60);
+                  wf_autonext = millis() + 3600000;
+                  break;
+                default:
+                  id(trigger_light).execute(); // Lichtkontrolle
+                  break;
+              }
+      - timing:
+          - on for at least 0.5s
+        then:
+          - logger.log: "Multiclickhold"
+          - while:
+              condition:
+                binary_sensor.is_on: button_1
+              then:
+                - logger.log: "Multiclickholding"
+                - lambda: |-
+                    Countdown &cd = countdowns[wf_countdown];
+                    if (!cd.is_running() && wf_current == CDDISP) wf_current = CDSET;
+                    if (!cd.is_running() && wf_current == CDSET) {
+                      cd.modify(60);
+                    }
+                - delay: 100ms
+
+  - platform: gpio
+    id: button_2
+    name: Button 2
+    internal: true
+    pin:
+      number: GPIO0
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_double_click:
+      then:
+        - logger.log: "Doubleclick"
+        - lambda:
+            if (wf_current == CDDISP || wf_current == CDSET) wf_autonext = 0;
+    on_multi_click:
+      - timing:
+          - on for 30ms to 350ms
+          - off for at least 150ms
+        then:
+          - logger.log: "Multiclicksingleclick"
+          - lambda: |-
+              if (id(buzzer_beep).is_running()) { // Stop alarms
+                id(buzzer_beep).stop();
+                id(stop_alarms).execute();
+                return;
+              }
+              switch(wf_current) {
+                case AUTO:
+                  wf_countdown = 0;
+                  wf_autonext = millis() + 60000;
+                  wf_current = CDDISP;
+                  break;
+                case CDDISP:
+                  if (wf_countdown < 2) {
+                    wf_countdown++;
+                    wf_autonext = millis() + 60000;
+                  } else {
+                    wf_autonext = 0; // Return to AUTO
+                  }
+                  break;
+                case CDSET:
+                  countdowns[wf_countdown].modify(-60);
+                  wf_autonext = millis() + 3600000;
+                  break;
+              }
+      - timing:
+          - on for at least 0.5s
+        then:
+          - logger.log: "Multiclickhold"
+          - while:
+              condition:
+                binary_sensor.is_on: button_2
+              then:
+                - logger.log: "Multiclickholding"
+                - lambda: |-
+                    Countdown &cd = countdowns[wf_countdown];
+                    if (!cd.is_running() && wf_current == CDDISP) wf_current = CDSET;
+                    if (!cd.is_running() && wf_current == CDSET) {
+                      cd.modify(-60);
+                    }
+                - delay: 100ms
+
+  - platform: template
+    id: cd1_alm
+    name: "Countdown 1 Alarm"
+    lambda: 'return countdowns[0].is_alarm();'
+  - platform: template
+    id: cd2_alm
+    name: "Countdown 2 Alarm"
+    lambda: 'return countdowns[1].is_alarm();'
+  - platform: template
+    id: cd3_alm
+    name: "Countdown 3 Alarm"
+    lambda: 'return countdowns[2].is_alarm();'
+  - platform: template
+    id: button_light
+    name: "Light Control Button"
+    trigger_on_initial_state: true
+
+text_sensor:
+  - platform: template
+    id: cd1_to
+    name: "Countdown 1 Rest"
+    retain: false
+    update_interval: never # Update aus Interval mit Filter auf Aenderung
+  - platform: template
+    id: cd2_to
+    name: "Countdown 2 Rest"
+    retain: false
+    update_interval: never # Update aus Interval mit Filter auf Aenderung
+  - platform: template
+    id: cd3_to
+    name: "Countdown 3 Rest"
+    retain: false
+    update_interval: never # Update aus Interval mit Filter auf Aenderung
+  - platform: mqtt_subscribe
+    id: thavail
+    internal: true
+    topic: kueche3/status
+
+switch:
+  - platform: template
+    id: auto_bright
+    name: Auto Brightness
+    restore_mode: ALWAYS_ON
+    optimistic: true
+    retain: false
+    on_turn_on:
+      - script.execute: set_autobrightness
+  - platform: template
+    id: cd1_start
+    name: "Countdown 1 laueft"
+    optimistic: true
+    turn_on_action:
+      - lambda: countdowns[0].start();
+    turn_off_action:
+      - lambda: countdowns[0].stop();
+  - platform: template
+    id: cd2_start
+    name: "Countdown 2 laueft"
+    optimistic: true
+    turn_on_action:
+      - lambda: countdowns[1].start();
+    turn_off_action:
+      - lambda: countdowns[1].stop();
+  - platform: template
+    id: cd3_start
+    name: "Countdown 3 laueft"
+    optimistic: true
+    turn_on_action:
+      - lambda: countdowns[2].start();
+    turn_off_action:
+      - lambda: countdowns[2].stop();
+
+
+output:
+  - platform: gpio
+    pin: GPIO2
+    inverted: true
+    id: buzzer_reserved
+
+globals:
+  - id: buzzer_repeat
+    type: int
+    initial_value: '30'
+
+script:
+  - id: buzzer_beep
+    then:
+      - globals.set:
+          id: buzzer_repeat
+          value: '30'
+      - while:
+          condition:
+            lambda: return(id(buzzer_repeat)-- > 0);
+          then:
+            - repeat:
+                count: 4
+                then:
+                  - lambda: |-
+                      uint32_t next_micros;
+                      for(uint32_t n = 0; n < 250; ++n) {
+                        next_micros = micros() + 125;
+                        digitalWrite(D4, LOW);
+                        while(micros() < next_micros);
+                        next_micros = micros() + 375;
+                        digitalWrite(D4, HIGH);
+                        while(micros() < next_micros);
+                      }
+                  - delay: 0.25s
+            - delay: 1s
+      - script.execute: stop_alarms
+  - id: stop_alarms
+    then:
+      - lambda:
+          if (countdowns[0].is_buzzing()) id(cd1_start).turn_off();
+          if (countdowns[1].is_buzzing()) id(cd2_start).turn_off();
+          if (countdowns[2].is_buzzing()) id(cd3_start).turn_off();
+  - id: set_autobrightness
+    then:
+      - lambda: |-
+          auto mylight = id(display);
+          if (id(auto_bright).state && mylight->remote_values.is_on()) {
+            const float min_light = 3;
+            const float max_light = 40;
+            const float min_bright = 1;
+            const float max_bright = 50;
+            float bright = (id(light_sensor).state - min_light) / (max_light - min_light) * (max_bright - min_bright) + min_bright;
+            bright = max(min_bright,bright);
+            bright = min(max_bright,bright);
+            if (static_cast<int>(100.0 * mylight->remote_values.get_brightness()) != static_cast<int>(bright))
+              mylight->make_call().set_transition_length(0).set_brightness(bright/100.0).perform();
+          }
+  - id: trigger_light
+    then:
+      - binary_sensor.template.publish:
+          id: button_light
+          state: ON
+      - delay: 0.25s
+      - binary_sensor.template.publish:
+          id: button_light
+          state: OFF
+  - id: cdstartstop
+    parameters:
+      cd: int
+      turnon: boolean
+    then:
+      - lambda: |-
+          if (turnon) {
+            switch(cd) {
+              case 0 : id(cd1_start).turn_on(); break;
+              case 1 : id(cd2_start).turn_on(); break;
+              case 2 : id(cd3_start).turn_on(); break;
+              default: break;
+            }
+          } else {
+            switch(cd) {
+              case 0 : id(cd1_start).turn_off(); break;
+              case 1 : id(cd2_start).turn_off(); break;
+              case 2 : id(cd3_start).turn_off(); break;
+              default: break;
+            }
+          }
+  - id: new_countdown
+    parameters:
+      seconds: int
+    then:
+      - lambda: |-
+          // Suche gestoppten Countdown mit kleinster Restzeit
+          int32_t cmp = 0x7fffffff;
+          int cd = -1;
+          for(int n=0; n<3; n++) {
+            if (!countdowns[n].is_running() && countdowns[n].restms() < cmp) {
+              cd = n;
+              cmp = countdowns[n].restms();
+            }
+          }
+          if (cd != -1 && seconds > 0) {
+            if (seconds > 86400) seconds = 86400;
+            countdowns[cd].set(seconds);
+            id(cdstartstop)->execute(cd,true);
+          }
+
+button:
+  - platform: template
+    name: Buzzer Start
+    icon: mdi:volume-high
+    on_press:
+      - script.execute: buzzer_beep
+
+  - platform: template
+    name: Buzzer Stop
+    icon: mdi:volume-low
+    on_press:
+      - script.stop: buzzer_beep
+
+  # Three seconds of every populated LED lit white, then
+  # back to the loop with the settings before
+  - platform: template
+    name: Lamp Test
+    on_press:
+      - lambda: |-
+          auto pan = id(panel);
+          pan->set_effect(0);
+          pan->set_digit_color(0, 0.5, 0.5, 0.5);
+          pan->set_digit_color(1, 0.5, 0.5, 0.5);
+          pan->set_digit_color(2, 0.5, 0.5, 0.5);
+          pan->set_digit_color(3, 0.5, 0.5, 0.5);
+          pan->lamp_test();
+          disp_next = EXTVAL;
+          wf_autonext = millis() + 3000;
+
+  - platform: restart
+    name: "Reboot me"
+    id: butt_reboot
+
+  - platform: template
+    id: cd1_res
+    name: "Countdown 1 Reset"
+    on_press:
+      - lambda: countdowns[0].reset();
+# Reset really needed?
+  - platform: template
+    id: cd2_res
+    name: "Countdown 2 Reset"
+    on_press:
+      - lambda: countdowns[1].reset();
+  - platform: template
+    id: cd3_res
+    name: "Countdown 3 Reset"
+    on_press:
+      - lambda: countdowns[2].reset();
+  - platform: template
+    id: cdnew_start
+    name: "Start new Countdown"
+    on_press:
+      then:
+      - script.execute:
+          id: new_countdown
+          seconds: !lambda return stringtodelay(id(cdnew_time).state);
+
+# A UI handle for the show_number action, which otherwise lives only under
+# Developer Tools > Actions. Setting either entity redraws immediately and the
+# panel falls back to the time ten seconds later on its own.
+select:
+  # Effects run on the device, not in Home Assistant, so a fade stays smooth
+  # and keeps going if the network drops. Every entity here is a normal one,
+  # so an automation can drive them, or call the set_effect action to set the
+  # lot at once.
+  - platform: template
+    name: Effect
+    id: effect_mode
+    optimistic: true
+    restore_value: true
+    initial_option: "None"
+    options: ["None", "Color Cycle", "Flash"]
+    set_action:
+      - lambda: |-
+          std::string v = x;
+          id(panel)->set_effect(v == "Color Cycle" ? 1 : v == "Flash" ? 2 : 0);
+
+  # Whole Panel moves everything together. Per Digit gives each digit its own
+  # phase, so the color walks across the four of them. Per LED gives every
+  # position its own, which is the smooth sweep.
+  - platform: template
+    name: Effect Spread
+    id: effect_spread
+    optimistic: true
+    restore_value: true
+    initial_option: "Whole Panel"
+    options: ["Whole Panel", "Per Digit", "Per LED"]
+    set_action:
+      - lambda: |-
+          std::string v = x;
+          id(panel)->set_effect_spread(v == "Per Digit" ? 1 : v == "Per LED" ? 2 : 0);
+
+number:
+  # Seconds for one full cycle. For Flash this is one complete on and off.
+  - platform: template
+    name: Effect Speed
+    id: effect_speed
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    min_value: 0.2
+    max_value: 600
+    step: 0.2
+    unit_of_measurement: s
+    mode: box
+    set_action:
+      - lambda: id(panel)->set_effect_speed(x);
+
+  # Which way the spread runs. 0 is left to right, 90 top to bottom, 180
+  # right to left. -45 is the bottom left to top right diagonal and 135 is
+  # the other one, top right to bottom left.
+  - platform: template
+    name: Effect Angle
+    id: effect_angle
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: -180
+    max_value: 180
+    step: 15
+    unit_of_measurement: deg
+    mode: box
+    set_action:
+      - lambda: id(panel)->set_effect_angle(x);
+
+  # How many degrees of the color wheel the panel covers end to end. A full
+  # 360 packs the whole spectrum across four digits and reads as noise, so
+  # the useful settings are narrow. 60 is roughly red through orange, 90
+  # reaches yellow. 0 puts the whole panel on one color that still cycles.
+  # Only Color Cycle uses this, and only when Spread is not Whole Panel.
+  - platform: template
+    name: Effect Hue Span
+    id: effect_hue_span
+    optimistic: true
+    restore_value: true
+    initial_value: 90
+    min_value: 0
+    max_value: 360
+    step: 5
+    unit_of_measurement: deg
+    mode: box
+    set_action:
+      - lambda: id(panel)->set_effect_hue_span(x);
+
+  # Seconds each flash transition takes, independent of the flash rate. 0
+  # snaps on and off. 0.1 gives a quick ramp. Anything past half the Effect
+  # Speed is capped there, which is the point where it becomes a triangle.
+  - platform: template
+    name: Flash Fade
+    id: fx_flash_fade
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 30
+    step: 0.05
+    unit_of_measurement: s
+    mode: box
+    set_action:
+      - lambda: id(panel)->set_flash_fade(x);
+
+text:
+  - platform: template
+    name: "New Countdown"
+    id: cdnew_time
+    optimistic: false
+    restore_value: false
+    initial_value: '0:00:20'
+    min_length: 0
+    max_length: 8
+    mode: text
+    set_action:
+      - lambda: |-
+          uint32_t d = stringtodelay(x);
+          std::string y = delaytostring(d);
+          id(cdnew_time)->publish_state(y); // FIXME: wenn x!=y, aber zu gleichem d fuehrt, klappts nicht
+

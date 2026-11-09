@@ -3,13 +3,20 @@
 #include "esphome/core/log.h"
 
 #include <cmath>
-#include <driver/gptimer.h>
-#include <soc/gpio_struct.h>
+
+#ifdef USE_ESP32
+#include <soc/gpio_reg.h>
+#include <soc/soc.h>
+#else // ESP8266
+#include <Arduino.h>
+#include <esp8266_peri.h>
+#endif
 
 namespace esphome {
 namespace aip33628 {
 
 static const char *const TAG = "aip33628";
+static Aip33628Panel *scan_instance = nullptr;
 
 // Each digit is one driver plus one pair of COM pairs, ten LED positions.
 // Driver 1 carries the hours, driver 2 the minutes.
@@ -104,17 +111,31 @@ static uint8_t glyph(char c) {
     case 'd': return 0b1011110;
     case 'E': return 0b1111001;
     case 'F': return 0b1110001;
+    case 'G': return 0b0111101;
+    case 'g': return 0b1101111;
     case 'H': return 0b1110110;
     case 'h': return 0b1110100;
+    case 'I': return 0b0110000;  // left side, so it does not read as a 1
+    case 'i': return 0b0010000;
+    case 'J': return 0b0011110;
     case 'L': return 0b0111000;
+    case 'l': return 0b0110000;
+    case 'N': return 0b0110111;  // tall, full height both sides
     case 'n': return 0b1010100;
+    case 'O': return 0b0111111;
     case 'o': return 0b1011100;
     case 'P': return 0b1110011;
+    case 'q': return 0b1100111;
     case 'r': return 0b1010000;
+    case 'S': return 0b1101101;
     case 't': return 0b1111000;
     case 'U': return 0b0111110;
     case 'u': return 0b0011100;
     case 'y': return 0b1101110;
+    case '_': return 0b0001000;
+    case '=': return 0b1001000;
+    case '\'': return 0b0000010;
+    case '"': return 0b0100010;
     case '0': return 0b0111111;
     case '1': return 0b0000110;
     case '2': return 0b1011011;
@@ -126,6 +147,7 @@ static uint8_t glyph(char c) {
     case '8': return 0b1111111;
     case '9': return 0b1101111;
     case '-': return 0b1000000;
+    case '%': return 0b1010010;
     default:  return 0;
   }
 }
@@ -172,17 +194,22 @@ static int com_index(uint8_t cs) {
 }
 
 void Aip33628Panel::setup() {
-  for (auto *p : {clk_, data_, clk2_, data2_}) {
+  for (auto *p : {clk_, data_, data2_}) {
     p->setup();
     p->digital_write(false);
   }
   clk_mask_ = 1u << clk_->get_pin();
   data_mask_ = 1u << data_->get_pin();
-  clk2_mask_ = 1u << clk2_->get_pin();
+  if (clk2_) {
+    clk2_->setup();
+    clk2_->digital_write(false);
+    clk_mask_ |= 1u << clk2_->get_pin();
+  }
   data2_mask_ = 1u << data2_->get_pin();
 
   render_();
 
+#ifdef USE_ESP32
   // A general purpose timer, not esp_timer. The esp_timer task dispatch path
   // runs at task priority on core 0 alongside the WiFi task, which preempts
   // it and stretches whichever COM slot happens to be lit. A 40us sub-frame
@@ -208,19 +235,28 @@ void Aip33628Panel::setup() {
     ESP_LOGE(TAG, "could not start the scan timer");
     this->mark_failed();
   }
+#else
+  // ESP8266 Timer1 runs from the 80MHz peripheral clock. With TIM_DIV16 it
+  // ticks at 5MHz, so one UNIT_US=40us scan tick is 200 timer ticks.
+  
+  scan_instance = this;
+  timer1_disable();
+  timer1_detachInterrupt();
+  timer1_isr_init();
+  timer1_attachInterrupt(&Aip33628Panel::scan_tick_);
+  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_LOOP);
+  timer1_write(UNIT_US * 5);
+#endif
 }
 
 void Aip33628Panel::dump_config() {
   ESP_LOGCONFIG(TAG, "AiP33628 panel:");
   LOG_PIN("  CLK: ", clk_);
   LOG_PIN("  DATA: ", data_);
-  LOG_PIN("  CLK_1: ", clk2_);
+  if (clk2_) LOG_PIN("  CLK_1: ", clk2_);
   LOG_PIN("  DATA_1: ", data2_);
   ESP_LOGCONFIG(TAG, "  Max current: IS 0x%X, %u.%umA per lit sink", max_current_,
                 IS_MA[max_current_] / 10, IS_MA[max_current_] % 10);
-  ESP_LOGCONFIG(TAG, "  Hour format: %s", twelve_hour_ ? "12 hour" : "24 hour");
-  ESP_LOGCONFIG(TAG, "  Colon: %s", blink_colon_ ? "blinking" : "steady");
-  ESP_LOGCONFIG(TAG, "  Network: %s", online_ ? "up" : "down");
   const char *fx = effect_ == Effect::CYCLE ? "color cycle"
                    : effect_ == Effect::FLASH ? "flash" : "none";
   const char *sp = spread_ == Spread::DIGIT ? "per digit"
@@ -239,18 +275,26 @@ void Aip33628Panel::dump_config() {
 //
 // CS and IS are common to the two drivers and only SS differs, so one pass
 // down the bits clocks both buses. That halves the work outright, and going
-// straight to the port registers rather than through ISRInternalGPIOPin took
-// the pair from 28.0us to 6.4us. The AiP33628 accepts 30MHz and asks for
-// 16ns of CLK high and low, and a store to the GPIO port costs more than
-// that on its own, so the loop needs no padding.
+// straight to the GPOS/GPOC registers.
+// The AiP33628 accepts 30MHz and asks for only 16ns of
+// CLK high and low, so explicit delay padding is not required.
+
+#ifdef USE_ESP32
+#define PORT_SET(m) REG_WRITE(GPIO_OUT_W1TS_REG, (m))
+#define PORT_CLR(m) REG_WRITE(GPIO_OUT_W1TC_REG, (m))
+#else // ESP8266
+#define PORT_SET(m) GPOS=(m)
+#define PORT_CLR(m) GPOC=(m)
+#endif
+
 void IRAM_ATTR Aip33628Panel::send_pair_(uint16_t ss1, uint16_t ss2, uint8_t cs, uint8_t is) {
   const uint32_t wire = (uint32_t) IS_WIRE[is & 0xF] << 24;
   uint32_t f1 = (uint32_t) ss1 | ((uint32_t) cs << 16) | wire;
   uint32_t f2 = (uint32_t) ss2 | ((uint32_t) cs << 16) | wire;
-  const uint32_t clks = clk_mask_ | clk2_mask_;
+  const uint32_t clks = clk_mask_;
   const uint32_t dats = data_mask_ | data2_mask_;
 
-  GPIO.out_w1tc = clks | dats;
+  PORT_CLR(clks | dats);
 
   for (int i = 0; i < 30; i++) {
     uint32_t set = 0;
@@ -261,18 +305,18 @@ void IRAM_ATTR Aip33628Panel::send_pair_(uint16_t ss1, uint16_t ss2, uint8_t cs,
     f1 >>= 1;
     f2 >>= 1;
     // Data settles while CLK is low, then one rising edge shifts both buses.
-    GPIO.out_w1tc = dats & ~set;
-    GPIO.out_w1ts = set;
-    GPIO.out_w1ts = clks;
+    PORT_CLR(dats & ~set);
+    PORT_SET(set);
+    PORT_SET(clks);
     if (i < 29)
-      GPIO.out_w1tc = clks;
+      PORT_CLR(clks);
   }
 
   // CLK is still high after bit 29. A DATA rising edge here is the latch.
-  GPIO.out_w1tc = dats;
-  GPIO.out_w1ts = dats;
-  GPIO.out_w1tc = dats;
-  GPIO.out_w1tc = clks;
+  PORT_CLR(dats);
+  PORT_SET(dats);
+  PORT_CLR(dats);
+  PORT_CLR(clks);
 }
 
 // Walk the schedule the renderer built. The timer runs at a fixed UNIT_US
@@ -284,13 +328,26 @@ void IRAM_ATTR Aip33628Panel::send_pair_(uint16_t ss1, uint16_t ss2, uint8_t cs,
 //
 // Most ticks do nothing. A saturated color collapses to one step per COM
 // pair, so fourteen of every fifteen calls are a decrement and a return.
+#ifdef USE_ESP32
 bool IRAM_ATTR Aip33628Panel::scan_tick_(gptimer_handle_t timer,
                                         const gptimer_alarm_event_data_t *edata, void *arg) {
   auto *self = static_cast<Aip33628Panel *>(arg);
+
   if (self->wait_ > 0) {
     self->wait_--;
     return false;
   }
+#else
+void IRAM_ATTR Aip33628Panel::scan_tick_() {
+  auto *self = scan_instance;
+  if (self == nullptr)
+    return;
+
+  if (self->wait_ > 0) {
+    self->wait_--;
+    return;  //Void function
+  }
+#endif
 
   const ScanBuf &b = self->buf_[self->front_];
 
@@ -307,7 +364,9 @@ bool IRAM_ATTR Aip33628Panel::scan_tick_(gptimer_handle_t timer,
   self->wait_ = (uint8_t) (st.units - 1);  // this tick is the first of the step
   uint8_t next = (uint8_t) (i + 1);
   self->step_ = next >= b.n ? 0 : next;
-  return false;  // no task woken, so no yield needed
+#ifdef USE_ESP32
+  return false;
+#endif
 }
 
 void Aip33628Panel::write_pos_(uint8_t block, uint8_t seg, bool on) {
@@ -352,24 +411,20 @@ void Aip33628Panel::set_light(bool on, float r, float g, float b, float brightne
 // that changes a color goes through here, so there is one place that decides
 // what a block ends up at and one place that marks the panel dirty.
 void Aip33628Panel::apply_colors_() {
-  // The lamp test outranks every color tier, including a running effect.
-  if (mode_ == Mode::LAMP) {
-    for (auto &blk : level_)
-      for (auto &seg : blk)
-        for (uint8_t &ch : seg)
-          ch = COLOR_LEVELS - 1;
-    dirty_ = true;
-    return;
-  }
-
   for (int blk = 0; blk < 4; blk++) {
     for (int seg = 0; seg < 9; seg++) {
       const float *c = pos_set_[blk][seg]  ? pos_rgb_[blk][seg]
                        : digit_set_[blk]   ? digit_rgb_[blk]
                                            : base_rgb_;
-      level_[blk][seg][CH_RED] = duty_level(c[0] * envelope_);
-      level_[blk][seg][CH_GREEN] = duty_level(c[1] * envelope_);
-      level_[blk][seg][CH_BLUE] = duty_level(c[2] * envelope_);
+      if (enabled_) { // FIXME if nach aussen
+        level_[blk][seg][CH_RED] = duty_level(c[0] * envelope_);
+        level_[blk][seg][CH_GREEN] = duty_level(c[1] * envelope_);
+        level_[blk][seg][CH_BLUE] = duty_level(c[2] * envelope_);
+      } else {
+        level_[blk][seg][CH_RED] = 0;
+        level_[blk][seg][CH_GREEN] = 0;
+        level_[blk][seg][CH_BLUE] = 0;
+      }
     }
   }
   dirty_ = true;
@@ -478,38 +533,85 @@ void Aip33628Panel::set_gradient(float r0, float g0, float b0, float r1, float g
   apply_colors_();
 }
 
-// A temporary mode is capped rather than trusted. Ten minutes is far longer
-// than any of these are useful for, and it means a bad automation cannot park
-// the panel on a stale number forever.
-static uint32_t mode_lifetime(int ms) {
-  if (ms < 100) return 100;
-  if (ms > 600000) return 600000;
-  return (uint32_t) ms;
-}
+void Aip33628Panel::show_text(const char *value, Annun annunciators) {
+  if (strlen(value) < 4) return;
 
-void Aip33628Panel::show_seconds(int ms) {
-  mode_ = Mode::SECONDS;
-  mode_until_ = millis() + mode_lifetime(ms);
+  if (!memcmp(value,text_,4) && annunciators == annunciators_) return;
+
+  annunciators_ = annunciators;
+  memcpy(text_,value,4);
+
+  for (auto &blk : on_) {
+    for (bool &v : blk) v = false;
+  }
+
+  for (uint8_t n = 0; n<4; ++n) write_digit_(n,text_[n]);
+  if (annunciators_ & Annun::AM) write_pos_(0, SEG_ANNUN, true);
+  if (annunciators_ & Annun::COL_HIGH) write_pos_(1, SEG_ANNUN, true);
+  if (annunciators_ & Annun::COL_LOW) write_pos_(1, SEG_ANNUN2, true);
+  if (annunciators_ & Annun::DASH) write_pos_(2, SEG_ANNUN, true);
+  if (annunciators_ & Annun::DEGREE) write_pos_(3, SEG_ANNUN, true);
+
   dirty_ = true;
 }
 
-void Aip33628Panel::show_number(int value, const std::string &unit, int ms) {
-  number_ = value;
-  // First character only. An empty unit gives the number the whole panel.
-  unit_ = unit.empty() ? '\0' : unit[0];
-  mode_ = Mode::NUMBER;
-  mode_until_ = millis() + mode_lifetime(ms);
-  dirty_ = true;
+void Aip33628Panel::show_clock_once(time::RealTimeClock *rtc, Annun annunciators, bool twelve_hour, bool online) {
+  ESPTime now{};
+  char rtext[4];
+  bool colon = (millis() / 1000) % 2 == 0;
+
+  if (rtc) now = rtc->now();
+  if (!now.is_valid()) {
+    show_text("----",annunciators);
+    return;
+  }
+
+  int hour = now.hour;
+  bool pm = hour >= 12;
+  if (twelve_hour) {
+   hour = hour % 12;
+   if (hour == 0) hour = 12;
+  }
+
+  // Leading zero stays suppressed in 24 hour mode as well.
+  if (hour >= 10) {
+    rtext[0] = (char) ('0' + hour / 10);
+  } else {
+    rtext[0] = ' ';
+  }
+  rtext[1] = (char) ('0' + hour % 10);
+  rtext[2] = (char) ('0' + now.minute / 10);
+  rtext[3] = (char) ('0' + now.minute % 10);
+
+  if (twelve_hour && !pm) annunciators = annunciators | Annun::AM;
+  if (colon) {
+    annunciators = annunciators | Annun::COL_LOW;
+    if (online) annunciators = annunciators | Annun::COL_HIGH;
+  }
+  show_text(rtext,annunciators);
 }
+
+void Aip33628Panel::show_temp_once(float temp, const unsigned char unit, Annun annunciators) {
+  char tempstr[16];
+  sprintf(tempstr, "%3d%c", static_cast<int>(10*temp),unit);
+  show_text(tempstr, annunciators | Annun::COL_LOW | Annun::DEGREE);
+}
+
+void Aip33628Panel::show_hum_once(float hum, Annun annunciators) {
+  char tempstr[16];
+  sprintf(tempstr, "%3d%%", static_cast<int>(10*hum));
+  show_text(tempstr, annunciators | Annun::COL_LOW);
+}
+
 
 // Every populated position, white, at a fixed brightness, for a few seconds.
 // This is a hardware check, so user color and brightness settings do not
 // change the result.
-void Aip33628Panel::lamp_test(int ms) {
-  mode_ = Mode::LAMP;
-  mode_until_ = millis() + mode_lifetime(ms);
-  lamp_current_ = current_for(LAMP_BRIGHTNESS);
-  apply_colors_();
+void Aip33628Panel::lamp_test() {
+  for (auto &blk : on_) {
+    for (bool &v : blk) v = true;
+  }
+  this->dirty_ = true;
 }
 
 // Right aligned, no colon. A unit takes the rightmost position and leaves
@@ -707,113 +809,8 @@ void Aip33628Panel::loop() {
     update_effect_(now_ms);
   }
 
-  // A temporary mode expires here rather than anywhere else, so there is one
-  // place that can put the panel back to being a clock.
-  if (mode_ != Mode::TIME && (int32_t) (now_ms - mode_until_) >= 0) {
-    bool was_lamp = mode_ == Mode::LAMP;
-    mode_ = Mode::TIME;
-    dirty_ = true;
-    if (was_lamp)
-      apply_colors_();
-  }
-
-  ESPTime now{};
-  bool valid = false;
-  if (time_ != nullptr) {
-    now = time_->now();
-    valid = now.is_valid();
-  }
-
-  // Whatever is on the panel, reduced to one number, so an unchanged display
-  // costs nothing. Time uses hour and minute together rather than the minute
-  // alone, because Home Assistant can push a new timezone at any point and
-  // every shift is a whole number of hours. A mode change sets dirty_ itself,
-  // so the key never has to encode which mode produced it.
-  int key = -1;
-  if (mode_ == Mode::NUMBER) {
-    key = number_;
-  } else if (valid) {
-    key = mode_ == Mode::SECONDS ? now.second : now.hour * 60 + now.minute;
-  }
-
-  // The colon blinks once a second, so the content changes more often than
-  // the time does. Blinking off means a steady colon, not a dark one.
-  bool colon = blink_colon_ ? ((now_ms / 1000) % 2 == 0) : true;
-
-  if (!dirty_ && key == last_key_ && colon == last_colon_) return;
-  last_key_ = key;
-  last_colon_ = colon;
+  if (!dirty_) return; // FIXME !enabled_
   dirty_ = false;
-
-  for (auto &blk : on_) {
-    for (bool &v : blk) v = false;
-  }
-
-  // A hardware check also works while the normal display light is off.
-  if (mode_ == Mode::LAMP) {
-    for (int blk = 0; blk < 4; blk++) {
-      for (int seg = 0; seg < 9; seg++)
-        on_[blk][seg] = GEOM[blk][seg].id != 0;
-    }
-    render_();
-    return;
-  }
-
-  if (!enabled_) {
-    render_();
-    return;
-  }
-
-  // A pushed number does not need the clock to be set, so it comes first.
-  if (mode_ == Mode::NUMBER) {
-    draw_number_(number_, unit_);
-    render_();
-    return;
-  }
-
-  if (!valid) {
-    // No time yet. Four dashes says so without pretending to know the hour.
-    for (int i = 0; i < 4; i++) write_digit_(i, '-');
-    render_();
-    return;
-  }
-
-  if (mode_ == Mode::SECONDS) {
-    // Seconds sit where the minutes normally do, behind a colon that stays
-    // steady, so the panel reads as :SS rather than as a bare two digit
-    // number that could be anything. The upper dot still follows the network.
-    write_digit_(2, (char) ('0' + now.second / 10));
-    write_digit_(3, (char) ('0' + now.second % 10));
-    if (online_) write_pos_(1, SEG_ANNUN, true);
-    write_pos_(1, SEG_ANNUN2, true);
-    render_();
-    return;
-  }
-
-  int hour = now.hour;
-  bool pm = hour >= 12;
-  if (twelve_hour_) {
-    hour = hour % 12;
-    if (hour == 0) hour = 12;
-  }
-
-  // Leading zero stays suppressed in 24 hour mode as well.
-  if (hour >= 10) {
-    write_digit_(0, (char) ('0' + hour / 10));
-  }
-  write_digit_(1, (char) ('0' + hour % 10));
-  write_digit_(2, (char) ('0' + now.minute / 10));
-  write_digit_(3, (char) ('0' + now.minute % 10));
-
-  if (colon) {
-    // Both dots when the network is up, the lower one alone when it is not.
-    // Block 2 COM low LED1 is the lower dot, see docs/display-map.md.
-    if (online_) write_pos_(1, SEG_ANNUN, true);
-    write_pos_(1, SEG_ANNUN2, true);
-  }
-  if (twelve_hour_ && !pm) {
-    write_pos_(0, SEG_ANNUN, true);  // AM indicator, lit through the morning
-  }
 
   render_();
 }
@@ -859,7 +856,7 @@ void Aip33628Panel::render_() {
   // colon on and colon off, and ran 0xF with a white digit lit.
   // The lamp test brings its own current, while max_current_ remains the
   // thermal ceiling for every mode.
-  uint8_t want = mode_ == Mode::LAMP ? lamp_current_ : requested_current_;
+  uint8_t want = requested_current_;
   uint8_t is = want < max_current_ ? want : max_current_;
 
   ScanBuf &b = buf_[front_ ^ 1];

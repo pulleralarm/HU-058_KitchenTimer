@@ -5,7 +5,9 @@
 #include "esphome/components/light/light_output.h"
 #include "esphome/components/time/real_time_clock.h"
 
+#ifdef USE_ESP32
 #include <driver/gptimer.h>
+#endif
 
 namespace esphome {
 namespace aip33628 {
@@ -14,7 +16,7 @@ namespace aip33628 {
 // Mapping, scan timing and the current budget are documented in
 // docs/display-map.md.
 
-static const uint8_t DRAM_ATTR COM_SEQ[4] = {0x30, 0x0C, 0x03, 0xC0};
+static const uint8_t COM_SEQ[4] = {0x30, 0x0C, 0x03, 0xC0};
 
 // Each COM pair holds the bus for 600us, so a full four pair cycle is 2400us
 // and the panel refreshes at 416.7Hz, within a hertz of what the stock
@@ -39,8 +41,8 @@ static const uint16_t IS_MA[16] = {25, 51, 76, 101, 126, 152, 177, 202,
 // rest of the frame. Steps 0 and 15 are palindromes, which is why getting
 // this wrong looks correct at both ends of the brightness range and scrambles
 // the order everywhere in between. The table is its own inverse.
-static const uint8_t DRAM_ATTR IS_WIRE[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
-                                              0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+static uint8_t IS_WIRE[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+                               0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
 
 enum Channel : uint8_t { CH_BLUE = 0, CH_GREEN = 1, CH_RED = 2 };
 
@@ -65,9 +67,12 @@ enum class Effect : uint8_t { NONE = 0, CYCLE = 1, FLASH = 2 };
 // position its own. The direction the spread runs is the effect angle.
 enum class Spread : uint8_t { PANEL = 0, DIGIT = 1, LED = 2 };
 
-// What the panel is showing. Everything except TIME is temporary and expires
-// on its own, so no caller can leave the clock stuck not being a clock.
-enum class Mode : uint8_t { TIME, SECONDS, NUMBER, LAMP };
+// Lit annunciators
+enum Annun : uint8_t { NONE = 0, AM = 1, COL_HIGH = 2, COL_LOW = 4, DASH = 8, DEGREE = 16 };
+inline Annun operator|(Annun a, Annun b)
+{
+    return static_cast<Annun>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+}
 
 // One step of the scan schedule: latch this pattern on both drivers, then
 // hold it for this long. Adjacent sub-frames with identical data collapse
@@ -89,33 +94,14 @@ struct ScanBuf {
 
 class Aip33628Panel : public Component {
  public:
-  void set_pins(InternalGPIOPin *clk, InternalGPIOPin *data, InternalGPIOPin *clk2,
-                InternalGPIOPin *data2) {
+  void set_pins(InternalGPIOPin *clk, InternalGPIOPin *data, 
+                InternalGPIOPin *clk2, InternalGPIOPin *data2) {
     clk_ = clk;
     data_ = data;
     clk2_ = clk2;
     data2_ = data2;
   }
-  void set_time(time::RealTimeClock *rtc) { time_ = rtc; }
   void set_max_current(uint8_t is) { max_current_ = is; }
-  // Both of these are live. Home Assistant drives them through template
-  // switches, so each has to force a redraw rather than wait for the next
-  // rollover.
-  void set_twelve_hour(bool v) {
-    twelve_hour_ = v;
-    dirty_ = true;
-  }
-  void set_blink_colon(bool v) {
-    blink_colon_ = v;
-    dirty_ = true;
-  }
-  // Offline drops the upper colon dot, so a glance at the panel says whether
-  // the time is still being kept honest. Driven from the wifi triggers in
-  // clock.yaml rather than by including the wifi component here.
-  void set_online(bool v) {
-    online_ = v;
-    dirty_ = true;
-  }
 
   void setup() override;
   void loop() override;
@@ -125,13 +111,14 @@ class Aip33628Panel : public Component {
   // Called by the light platform. Color components and brightness are 0 to 1.
   void set_light(bool on, float r, float g, float b, float brightness);
 
-  // Temporary displays, driven from the api actions in clock.yaml. Each takes
-  // a lifetime in milliseconds and falls back to the time when it runs out.
-  void show_seconds(int ms);
-  void show_number(int value, const std::string &unit, int ms);
-  // Every populated position, white, at a fixed brightness. Ignores the
-  // color tiers, any running effect, and the light being off.
-  void lamp_test(int ms);
+  void lamp_test();
+
+  // Call these to show some values once
+  void show_text(const char *value, Annun annunciators = Annun::NONE);
+  void show_clock_once(time::RealTimeClock *rtc, Annun annunciators = Annun::NONE,
+		       bool twelve_hour = false, bool online = true);
+  void show_temp_once(float temp, const unsigned char unit, Annun annunciators = Annun::NONE);
+  void show_hum_once(float hum, Annun annunciators = Annun::NONE);
 
   // Per digit color. Blocks are 0 to 3, left to right, and each carries its
   // own annunciator: block 0 the AM mark, block 1 the colon, block 2 the date
@@ -168,27 +155,28 @@ class Aip33628Panel : public Component {
   void write_digit_(uint8_t block, char c);
   void write_pos_(uint8_t block, uint8_t seg, bool on);
   void draw_number_(int value, char unit);
+#ifdef USE_ESP32
   static bool scan_tick_(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata,
                          void *arg);
   void send_pair_(uint16_t ss1, uint16_t ss2, uint8_t cs, uint8_t is);
+#else
+  static void IRAM_ATTR scan_tick_();
+  void IRAM_ATTR send_pair_(uint16_t ss1, uint16_t ss2, uint8_t cs, uint8_t is);
+#endif
 
   InternalGPIOPin *clk_{nullptr};
   InternalGPIOPin *data_{nullptr};
   InternalGPIOPin *clk2_{nullptr};
   InternalGPIOPin *data2_{nullptr};
-  time::RealTimeClock *time_{nullptr};
 
-  // Port bit masks for the four pins. A frame goes out as direct register
-  // stores with both buses clocked together, which takes 6.4us against 28.0us
-  // for two passes through ISRInternalGPIOPin. All four pins have to live
-  // below GPIO32 for this, which __init__.py enforces at config time.
-  uint32_t clk_mask_{0}, data_mask_{0}, clk2_mask_{0}, data2_mask_{0};
+  // Port bit masks for the four pins. A frame goes out through the ESP8266
+  // GPOS/GPOC registers with both buses clocked together. Those registers
+  // cover GPIO0 through GPIO15; __init__.py also rejects the flash pins 6..11.
+  // As both clocks are driven in sync, use only one clock mask
+  uint32_t clk_mask_{0}, data_mask_{0}, data2_mask_{0};
 
 
   uint8_t max_current_{15};
-  bool twelve_hour_{true};
-  bool blink_colon_{true};
-  bool online_{false};
 
   // Which positions are lit, before color is applied.
   bool on_[4][9]{};   // [block][segment], segments A..G then annunciator, annunciator 2
@@ -231,14 +219,14 @@ class Aip33628Panel : public Component {
   volatile uint8_t step_{0};
   volatile uint8_t wait_{0};  // ticks left before the next step is latched
 
-  Mode mode_{Mode::TIME};
   uint32_t mode_until_{0};
   uint8_t lamp_current_{0};
   int number_{0};
   char unit_{'\0'};
 
-  int last_key_{-1};  // whatever the current mode reduces its content to
-  bool last_colon_{false};
+  char text_[4];
+  Annun annunciators_;
+
   bool dirty_{true};
 };
 
