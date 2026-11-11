@@ -102,7 +102,7 @@ Countdown set mode is signalled by lighting the AM indicator. In countdown set m
 For every countdown, these entities are exposed:
 
 - Switch whether the countdown is running
-- Remaining time, hh:mm with leading zero until the last minute, then 0:ss (without leading zero), 00:00 when the countdown has finished
+- Remaining time as hh:mm:ss. The update frequency is dynamic to reduce network traffic: Every second for the last minute, or every 10 seconds for 1-10min, or once per minute.
 - Alarm sensor
 - Reset button to last time (I may remove this)
 

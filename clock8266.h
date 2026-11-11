@@ -79,12 +79,10 @@ bool Countdown::is_alarm() {
  
 std::string Countdown::reststr_ha() const {
  int32_t rest = rest_millis_ / 1000;
- if (rest <= 0) return "00:00";
- if (rest < 60) { // 1min
-  return str_sprintf(" 0:%02" PRIi32, rest);
- } // Sonst hh:mm
- rest /= 60;
- return str_sprintf("%02" PRIu32 ":%02" PRIu32 , rest/60, rest%60);
+ if (rest <= 0) return "00:00:00";
+ if (rest > 600) rest -= rest % 60; // >10min: Aufloesung 1min
+ else if (rest > 60) rest -= rest % 10; // 1-10min: Aufloesung 10sek
+ return str_sprintf("%02" PRIu32 ":%02" PRIu32 ":%02" PRIu32, rest / 3600, rest % 3600 / 60, rest % 60);
 }
 
 std::string Countdown::reststr_gui() const {
